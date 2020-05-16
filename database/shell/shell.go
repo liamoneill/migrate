@@ -3,6 +3,7 @@
 package shell
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"strconv"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4/database"
 
@@ -27,6 +29,8 @@ func init() {
 
 type Config struct {
 	MigrationsTable string
+	Timeout         time.Duration
+	Verbose         bool
 }
 
 type Shell struct {
@@ -34,10 +38,28 @@ type Shell struct {
 	config   *Config
 }
 
-func (p *Shell) Open(url string) (database.Driver, error) {
+func (s *Shell) Open(url string) (database.Driver, error) {
 	shellURL, err := nurl.Parse(url)
 	if err != nil {
 		return nil, err
+	}
+
+	timeoutString := shellURL.Query().Get("x-timeout")
+	timeout := time.Duration(0)
+	if timeoutString != "" {
+		timeout, err = time.ParseDuration(timeoutString)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	verboseString := shellURL.Query().Get("x-verbose")
+	verbose := true
+	if verboseString != "" {
+		verbose, err = strconv.ParseBool(verboseString)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	dynamodbTable := shellURL.Query().Get("x-dynamodb-table")
@@ -54,14 +76,16 @@ func (p *Shell) Open(url string) (database.Driver, error) {
 		dynamodb: dynamodbService,
 		config: &Config{
 			MigrationsTable: dynamodbTable,
+			Timeout:         timeout,
+			Verbose:         verbose,
 		},
 	}
 
 	return shell, nil
 }
 
-func (p *Shell) Run(migration io.Reader) error {
-	tempDir, err := ioutil.TempDir("", "migration_shell")
+func (s *Shell) Run(migration io.Reader) error {
+	tempDir, err := ioutil.TempDir("", "shell_migration")
 	if err != nil {
 		return err
 	}
@@ -78,7 +102,20 @@ func (p *Shell) Run(migration io.Reader) error {
 		return err
 	}
 
-	err = exec.Command(executablePath).Run()
+	ctx := context.Background()
+	if s.config.Timeout > time.Duration(0) {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.config.Timeout)
+		defer cancel()
+	}
+
+	cmd := exec.CommandContext(ctx, executablePath)
+	if s.config.Verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+
+	err = cmd.Run()
 	if err != nil {
 		return err
 	}
@@ -86,9 +123,9 @@ func (p *Shell) Run(migration io.Reader) error {
 	return nil
 }
 
-func (p *Shell) SetVersion(version int, dirty bool) error {
+func (s *Shell) SetVersion(version int, dirty bool) error {
 	putItemInput := &dynamodb.PutItemInput{
-		TableName: aws.String(p.config.MigrationsTable),
+		TableName: aws.String(s.config.MigrationsTable),
 		Item: map[string]*dynamodb.AttributeValue{
 			"ID": {
 				S: aws.String("LatestMigrationVersion"),
@@ -102,13 +139,13 @@ func (p *Shell) SetVersion(version int, dirty bool) error {
 		},
 	}
 
-	_, err := p.dynamodb.PutItem(putItemInput)
+	_, err := s.dynamodb.PutItem(putItemInput)
 	return err
 }
 
-func (p *Shell) Version() (version int, dirty bool, err error) {
+func (s *Shell) Version() (version int, dirty bool, err error) {
 	getItemInput := &dynamodb.GetItemInput{
-		TableName: aws.String(p.config.MigrationsTable),
+		TableName: aws.String(s.config.MigrationsTable),
 		Key: map[string]*dynamodb.AttributeValue{
 			"ID": {
 				S: aws.String("LatestMigrationVersion"),
@@ -116,7 +153,7 @@ func (p *Shell) Version() (version int, dirty bool, err error) {
 		},
 	}
 
-	result, err := p.dynamodb.GetItem(getItemInput)
+	result, err := s.dynamodb.GetItem(getItemInput)
 	if err != nil {
 		return
 	}
@@ -160,18 +197,18 @@ func (p *Shell) Version() (version int, dirty bool, err error) {
 	return
 }
 
-func (p *Shell) Close() error {
+func (s *Shell) Close() error {
 	return nil
 }
 
-func (p *Shell) Drop() error {
+func (s *Shell) Drop() error {
 	return nil
 }
 
-func (p *Shell) Lock() error {
+func (s *Shell) Lock() error {
 	return nil
 }
 
-func (p *Shell) Unlock() error {
+func (s *Shell) Unlock() error {
 	return nil
 }
